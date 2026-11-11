@@ -10,7 +10,11 @@ vi.mock("~/db", () => ({
   },
 }));
 
-import { getRefundEligibility } from "./refund-requests.server";
+import {
+  countPendingRefundRequests,
+  getRefundEligibility,
+  listRefundRequests,
+} from "./refund-requests.server";
 
 let base: ReturnType<typeof seedBaseData>;
 
@@ -101,12 +105,19 @@ function addSeat(
 
 function raiseRefundRequest(
   purchaseId: number,
-  status: schema.RefundRequestStatus
+  status: schema.RefundRequestStatus,
+  extra: Partial<typeof schema.refundRequests.$inferInsert> = {}
 ) {
-  testDb
+  return testDb
     .insert(schema.refundRequests)
-    .values({ purchaseId, status, reason: "It was not what I expected." })
-    .run();
+    .values({
+      purchaseId,
+      status,
+      reason: "It was not what I expected.",
+      ...extra,
+    })
+    .returning()
+    .get();
 }
 
 describe("getRefundEligibility", () => {
@@ -211,5 +222,137 @@ describe("getRefundEligibility", () => {
     today(new Date(2026, 0, 2));
 
     expect(getRefundEligibility(purchase.id)).toMatchObject({ eligible: true });
+  });
+});
+
+describe("listRefundRequests", () => {
+  it("lists only Pending Refund Requests with what an Admin needs to decide", () => {
+    const [first] = addLessons(4);
+    completeLesson(first.id);
+    const purchase = buyCourse(new Date(2026, 0, 1, 10, 0), 4900);
+    const request = raiseRefundRequest(
+      purchase.id,
+      schema.RefundRequestStatus.Pending,
+      { requestedAt: new Date(2026, 0, 3, 9, 0).toISOString() }
+    );
+    raiseRefundRequest(purchase.id, schema.RefundRequestStatus.Declined);
+    today(new Date(2026, 0, 4));
+
+    expect(listRefundRequests(schema.RefundRequestStatus.Pending)).toEqual([
+      {
+        id: request.id,
+        status: schema.RefundRequestStatus.Pending,
+        learner: {
+          id: base.user.id,
+          name: "Test User",
+          email: "test@example.com",
+        },
+        course: {
+          id: base.course.id,
+          title: "Test Course",
+          slug: "test-course",
+        },
+        purchaseId: purchase.id,
+        amountPaid: 4900,
+        purchasedAt: new Date(2026, 0, 1, 10, 0).toISOString(),
+        requestedAt: new Date(2026, 0, 3, 9, 0).toISOString(),
+        completionPercent: 25,
+        reason: "It was not what I expected.",
+        decidedAt: null,
+        decidedBy: null,
+        declineReason: null,
+        warning: null,
+      },
+    ]);
+  });
+
+  it("lists Declined Refund Requests with who Declined them, when and why", () => {
+    const admin = testDb
+      .insert(schema.users)
+      .values({
+        name: "Test Admin",
+        email: "admin@example.com",
+        role: schema.UserRole.Admin,
+      })
+      .returning()
+      .get();
+    const purchase = buyCourse(new Date(2026, 0, 1));
+    raiseRefundRequest(purchase.id, schema.RefundRequestStatus.Pending);
+    raiseRefundRequest(purchase.id, schema.RefundRequestStatus.Approved, {
+      decidedAt: new Date(2026, 0, 2).toISOString(),
+      decidedByUserId: admin.id,
+    });
+    const declined = raiseRefundRequest(
+      purchase.id,
+      schema.RefundRequestStatus.Declined,
+      {
+        decidedAt: new Date(2026, 0, 3).toISOString(),
+        decidedByUserId: admin.id,
+        declineReason: "You have finished the course.",
+      }
+    );
+
+    expect(listRefundRequests(schema.RefundRequestStatus.Declined)).toEqual([
+      expect.objectContaining({
+        id: declined.id,
+        status: schema.RefundRequestStatus.Declined,
+        decidedAt: new Date(2026, 0, 3).toISOString(),
+        decidedBy: { id: admin.id, name: "Test Admin" },
+        declineReason: "You have finished the course.",
+        warning: null,
+      }),
+    ]);
+  });
+
+  it("warns on a Pending request when the learner has since watched too much", () => {
+    const [first, second] = addLessons(4);
+    const purchase = buyCourse(new Date(2026, 0, 1));
+    raiseRefundRequest(purchase.id, schema.RefundRequestStatus.Pending);
+    completeLesson(first.id);
+    completeLesson(second.id);
+    today(new Date(2026, 0, 2));
+
+    expect(listRefundRequests(schema.RefundRequestStatus.Pending)).toEqual([
+      expect.objectContaining({ warning: "watched_too_much" }),
+    ]);
+  });
+
+  it("warns on a Pending request when a team seat has since been claimed", () => {
+    const purchase = buyCourse(new Date(2026, 0, 1));
+    raiseRefundRequest(purchase.id, schema.RefundRequestStatus.Pending);
+    addSeat(purchase.id, "SEAT-CLAIMED", { claimedBy: base.instructor.id });
+    today(new Date(2026, 0, 2));
+
+    expect(listRefundRequests(schema.RefundRequestStatus.Pending)).toEqual([
+      expect.objectContaining({ warning: "claimed_team_seat" }),
+    ]);
+  });
+
+  it("does not warn when a Pending request has waited past the Refund Window", () => {
+    const purchase = buyCourse(new Date(2026, 0, 1));
+    raiseRefundRequest(purchase.id, schema.RefundRequestStatus.Pending, {
+      requestedAt: new Date(2026, 0, 10).toISOString(),
+    });
+    today(new Date(2026, 1, 1));
+
+    expect(listRefundRequests(schema.RefundRequestStatus.Pending)).toEqual([
+      expect.objectContaining({ warning: null }),
+    ]);
+  });
+});
+
+describe("countPendingRefundRequests", () => {
+  it("counts only Pending Refund Requests", () => {
+    const purchase = buyCourse(new Date(2026, 0, 1));
+    raiseRefundRequest(purchase.id, schema.RefundRequestStatus.Pending);
+    raiseRefundRequest(purchase.id, schema.RefundRequestStatus.Pending);
+    raiseRefundRequest(purchase.id, schema.RefundRequestStatus.Approved);
+    raiseRefundRequest(purchase.id, schema.RefundRequestStatus.Declined);
+
+    expect(countPendingRefundRequests()).toBe(2);
+  });
+
+  it("is zero when nothing is Pending", () => {
+    expect(countPendingRefundRequests()).toBe(0);
   });
 });
