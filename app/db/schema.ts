@@ -247,8 +247,10 @@ export const refundRequests = sqliteTable(
     requestedAt: text("requested_at")
       .notNull()
       .$defaultFn(() => new Date().toISOString()),
-    resolvedAt: text("resolved_at"),
-    resolvedByUserId: integer("resolved_by_user_id").references(() => users.id),
+    decidedAt: text("decided_at"),
+    decidedByUserId: integer("decided_by_user_id").references(() => users.id),
+    // Set only when an Admin Declines the request.
+    declineReason: text("decline_reason"),
   },
   (table) => [index("refund_requests_purchase_idx").on(table.purchaseId)]
 );
